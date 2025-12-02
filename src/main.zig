@@ -153,6 +153,7 @@ const Extent = struct { start: usize, limit: usize };
 const key_minimum_zig_version = ".minimum_zig_version";
 const key_zig_version = ".zig_version";
 const key_mach_zig_version = ".mach_zig_version";
+const key_default_zig_version = ".default_zig_version";
 
 fn extractZigVersion(zon: []const u8, needle: []const u8) ?Extent {
     var offset: usize = 0;
@@ -233,6 +234,54 @@ fn loadBuildZigZon(arena: Allocator, build_root: BuildRoot) !?[]const u8 {
     return try zon.readToEndAlloc(arena, std.math.maxInt(usize));
 }
 
+fn getUserConfigDir(arena: Allocator) ?[]const u8 {
+    if (native_os == .windows) {
+        // On Windows, use %APPDATA%/anyzig
+        return std.fs.getAppDataDir(arena, "anyzig") catch return null;
+    } else {
+        // On Unix-like systems, use ~/.config/anyzig
+        const home = std.posix.getenv("HOME") orelse return null;
+        return std.fs.path.join(arena, &.{ home, ".config", "anyzig" }) catch return null;
+    }
+}
+
+fn loadUserConfigZon(arena: Allocator) ?[]const u8 {
+    const config_dir = getUserConfigDir(arena) orelse return null;
+    const config_path = std.fs.path.join(arena, &.{ config_dir, "config.zig.zon" }) catch |e| oom(e);
+    defer arena.free(config_path);
+
+    const file = std.fs.cwd().openFile(config_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => |e| {
+            log.warn("failed to open config file '{s}': {s}", .{ config_path, @errorName(e) });
+            return null;
+        },
+    };
+    defer file.close();
+
+    const content = file.readToEndAlloc(arena, std.math.maxInt(usize)) catch |err| {
+        log.warn("failed to read config file '{s}': {s}", .{ config_path, @errorName(err) });
+        return null;
+    };
+
+    log.info("loaded user config from '{s}'", .{config_path});
+    return content;
+}
+
+fn getDefaultVersionFromConfig(arena: Allocator) ?SemanticVersion {
+    const config_zon = loadUserConfigZon(arena) orelse return null;
+    defer arena.free(config_zon);
+
+    const version_extent = extractZigVersion(config_zon, key_default_zig_version) orelse return null;
+    const version_str = config_zon[version_extent.start..version_extent.limit];
+
+    log.info("{s} '{s}' pulled from user config", .{ key_default_zig_version, version_str });
+    return SemanticVersion.parse(version_str) orelse {
+        log.warn("user config has invalid {s} \"{s}\"", .{ key_default_zig_version, version_str });
+        return null;
+    };
+}
+
 fn isMachVersion(v: SemanticVersion) bool {
     if (v.build == null) {
         if (v.pre) |pre| return std.mem.eql(u8, pre.slice(), "mach");
@@ -240,10 +289,9 @@ fn isMachVersion(v: SemanticVersion) bool {
     return false;
 }
 
-fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !SemanticVersion {
+fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !?SemanticVersion {
     const zon = try loadBuildZigZon(scratch, build_root) orelse {
-        log.err("TODO: no build.zig.zon file, maybe try determining zig version from build.zig?", .{});
-        std.process.exit(0xff);
+        return null;
     };
     defer scratch.free(zon);
 
@@ -272,10 +320,7 @@ fn determineSemanticVersion(scratch: Allocator, build_root: BuildRoot) !Semantic
         );
     }
 
-    errExit(
-        "build.zig.zon is missing minimum_zig_version, either add it or run '{s} VERSION' to specify a version",
-        .{@tagName(build_options.exe)},
-    );
+    return null;
 
     // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
     // TODO: if we find ".{ .path = "..." }" in build.zig then we know zig must be older than 0.13.0
@@ -365,15 +410,33 @@ pub fn main() !void {
             if (std.mem.eql(u8, command, "any")) std.process.exit(try anyCommand(cmdline, cmdline_offset + 1));
         }
         if (manual_version) |version| break :blk .{ version, false };
-        const build_root = try findBuildRoot(arena, build_root_options) orelse {
+        const build_root = try findBuildRoot(arena, build_root_options);
+        if (build_root) |br| {
+            if (try determineSemanticVersion(arena, br)) |version| {
+                break :blk .{ .{ .semantic = version }, false };
+            }
+        }
+        // No version found from build.zig.zon, try user config default
+        if (getDefaultVersionFromConfig(arena)) |default_version| {
+            break :blk .{ .{ .semantic = default_version }, false };
+        }
+        if (build_root != null) {
+            // build.zig exists but build.zig.zon is missing minimum_zig_version
+            try std.io.getStdErr().writeAll(
+                "build.zig.zon is missing minimum_zig_version, you can:\n" ++
+                    "  1. add " ++ key_minimum_zig_version ++ " to build.zig.zon\n" ++
+                    "  2. run '" ++ exe_str ++ " VERSION' to specify a version\n" ++
+                    "  3. set a default version in " ++ (if (native_os == .windows) "%APPDATA%\\anyzig\\config.zig.zon" else "~/.config/anyzig/config.zig.zon") ++ "\n",
+            );
+        } else {
             try std.io.getStdErr().writeAll(
                 "no build.zig to pull a zig version from, you can:\n" ++
                     "  1. run '" ++ exe_str ++ " VERSION' to specify a version\n" ++
-                    "  2. run from a directory where a build.zig can be found\n",
+                    "  2. run from a directory where a build.zig can be found\n" ++
+                    "  3. set a default version in " ++ (if (native_os == .windows) "%APPDATA%\\anyzig\\config.zig.zon" else "~/.config/anyzig/config.zig.zon") ++ "\n",
             );
-            std.process.exit(0xff);
-        };
-        break :blk .{ .{ .semantic = try determineSemanticVersion(arena, build_root) }, false };
+        }
+        std.process.exit(0xff);
     };
 
     const app_data_path = try std.fs.getAppDataDir(arena, "anyzig");
